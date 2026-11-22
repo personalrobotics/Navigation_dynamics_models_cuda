@@ -1,0 +1,410 @@
+#include <algorithm>
+#include "solve_2pbvp.h"
+#include <boost/functional/hash.hpp>
+#include <cfloat>
+#include <cmath>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+#include "lazy_index.h"
+
+using namespace std;
+
+constexpr int n_dims = 4;
+constexpr int hash_dims = 4;
+constexpr int n_cont = 2;
+
+// CPU implementations of CUDA functions
+// Launches kinodynamic simulation for multiple rollouts on CPU
+void kinodynamic_launcher_cpu(
+    float *state, float *intermediate_states, const float *heightmap,
+    const float *costmap, bool *valid, float *cost, float dt, int timesteps,
+    int rollouts, int n_dims, int n_cont, const int map_size_px, float map_res,
+    float car_l2, float car_w2, float max_vel, float min_vel, float RI,
+    float max_vert_acc, float max_theta, float gear_switch_time,
+    int patch_length_px, int patch_width_px, const int blocks,
+    const int threads, const float *controls);
+
+// Checks validity of multiple states against a bitmap on CPU
+void check_validity_launcher_cpu(const float *bitmap, int map_size_px,
+                                 float map_res, float *states,
+                                 int patch_length_px, int patch_width_px,
+                                 float car_l2, float car_w2, int n_states,
+                                 int n_dims, bool *result);
+
+size_t calc_hash(float *pose, const float *resolution) {
+  std::size_t hash_val = 0;
+  for (int i = 0; i < hash_dims; ++i) {
+    boost::hash_combine(hash_val, std::hash<size_t>{}(static_cast<int>(
+                                      std::round(pose[i] / resolution[i]))));
+  }
+  return hash_val;
+}
+
+#include "node.h"
+#include "trajectory_export.h"
+
+class Environment {
+  int map_size_px, threads, blocks, n_succ, patch_length_px, patch_width_px;
+  float epsilon[n_dims];
+  float *h_heightmap, *h_costmap; // CPU versions
+  float dt, map_res;
+  float car_l2, car_w2;
+  float max_vel, min_vel, RI, max_theta, max_vert_acc, gear_switch_time;
+  float *controls; // Store controls for CPU version
+
+public:
+  int timesteps;
+  int time_direction;
+  float resolution[n_dims];
+  float tolerance[n_dims];
+  float local_controllability_radius[n_dims];
+  NearMeet2PBVP near_meet_;
+#define IGHASTAR_MEET_ANGULAR_DIMS(env) ((env)->near_meet_.angular_dims)
+  sampling::GoalSamplingConfig goal_sampling;
+  float division_factor;
+
+  Environment(const py::dict &config, int time_direction_ = 1)
+      : h_heightmap(nullptr), h_costmap(nullptr), controls(nullptr),
+        time_direction(time_direction_) {
+    auto info = config["experiment_info_default"].cast<py::dict>();
+    auto node_info = info["node_info"].cast<py::dict>();
+
+    // Top-level fields
+    map_res = node_info["map_res"].cast<float>();
+    division_factor = info["division_factor"].cast<float>();
+
+    set_resolutions(info, node_info);
+    set_car_params(node_info);
+
+    threads = 1; // CPU version doesn't need thread/block calculations
+    blocks = 1;
+    goal_sampling = sampling::load_goal_sampling(
+        config, n_dims, local_controllability_radius);
+    near_meet_.load(config, n_dims, local_controllability_radius,
+                    goal_sampling.angular_dims, n_cont);
+  }
+
+  virtual ~Environment() {
+    if (h_costmap) {
+      delete[] h_costmap;
+      h_costmap = nullptr;
+    }
+    if (h_heightmap) {
+      delete[] h_heightmap;
+      h_heightmap = nullptr;
+    }
+    if (controls) {
+      delete[] controls;
+      controls = nullptr;
+    }
+  }
+
+  // Sets resolution, tolerance, and epsilon values for different dimensions
+  void set_resolutions(py::dict &info, py::dict &node_info) {
+    float res = info["resolution"].cast<float>();
+    float tol = info["tolerance"].cast<float>();
+    float del_theta = node_info["del_theta"].cast<float>() / 57.3;
+    float del_vel = node_info["del_vel"].cast<float>();
+
+    // For backward search, use backward_epsilon if available
+    std::vector<float> eps;
+    if (time_direction == -1 && info.contains("backward_epsilon")) {
+      eps = info["backward_epsilon"].cast<std::vector<float>>();
+    } else {
+      eps = info["epsilon"].cast<std::vector<float>>();
+    }
+
+    resolution[0] = res;
+    resolution[1] = res;
+    resolution[2] = res * del_theta;
+    resolution[3] = res * del_vel;
+    tolerance[0] = tol;
+    tolerance[1] = tol;
+    tolerance[2] = tol * del_theta;
+    tolerance[3] = tol * del_vel;
+    for (int i = 0; i < n_dims && i < static_cast<int>(eps.size()); i++) {
+      epsilon[i] = eps[i];
+    }
+
+    // Set LCR from config if available, otherwise use epsilon
+    if (info.contains("LCR")) {
+      auto lcr = info["LCR"].cast<std::vector<float>>();
+      for (int i = 0; i < n_dims; i++) {
+        local_controllability_radius[i] =
+            (i < static_cast<int>(lcr.size())) ? lcr[i] : epsilon[i];
+      }
+    } else {
+      for (int i = 0; i < n_dims; i++) {
+        local_controllability_radius[i] = epsilon[i];
+      }
+    }
+  }
+
+  // Sets car parameters and allocates controls array
+  void set_car_params(py::dict &info) {
+    car_l2 = info["length"].cast<float>() / 2;
+    car_w2 = info["width"].cast<float>() / 2;
+    max_vel = info["max_vel"].cast<float>();
+    min_vel = info["min_vel"].cast<float>();
+    RI = info["RI"].cast<float>();
+    max_theta = info["max_theta"].cast<float>() / 57.3;
+    max_vert_acc = info["max_vert_acc"].cast<float>();
+    patch_length_px = int(car_l2 * 2 / map_res);
+    patch_width_px = int(car_w2 * 2 / map_res);
+    timesteps = info["timesteps"].cast<int>();
+    dt = info["dt"].cast<float>() * float(time_direction);
+    gear_switch_time = info["gear_switch_time"].cast<float>();
+
+    auto steering_list = info["steering_list"].cast<std::vector<float>>();
+    auto throttle_list = info["throttle_list"].cast<std::vector<float>>();
+    n_succ = int(steering_list.size()) * int(throttle_list.size());
+    float step_size = info["step_size"].cast<float>();
+
+    controls = new float[n_succ * timesteps * n_cont];
+    int idx = 0;
+    for (size_t i = 0; i < throttle_list.size(); ++i) {
+      for (size_t j = 0; j < steering_list.size(); ++j) {
+        float edge_control[n_cont];
+        edge_control[0] = tanf(steering_list[j] / 57.3) / (car_l2 * 2);
+        edge_control[1] = throttle_list[i] * step_size;
+        for (int t = 0; t < timesteps; t++) {
+          memcpy(&controls[(idx * timesteps + t) * n_cont], edge_control,
+                 n_cont * sizeof(float));
+        }
+        ++idx;
+      }
+    }
+  }
+
+  // Sets the world map (costmap and heightmap) from a PyTorch tensor
+  void set_world(torch::Tensor world) {
+    TORCH_CHECK(world.dim() != 4,
+                "The CPU kinodynamic environment does not support ESDF worlds "
+                "(4D tensors); use the CUDA environment or set map_type to "
+                "'elevation'");
+    TORCH_CHECK(world.dim() == 3, "World tensor must be 3D (H x W x 2)");
+    TORCH_CHECK(world.size(2) == 2,
+                "Last dimension must have size 2 (costmap + heightmap)");
+    TORCH_CHECK(world.dtype() == torch::kFloat32,
+                "World tensor must be float32");
+    TORCH_CHECK(world.device().is_cpu(), "World tensor must be on CPU");
+
+    int H = world.size(0);
+    int W = world.size(1);
+    int map_size = H * W;
+
+    auto costmap =
+        world.index({torch::indexing::Slice(), torch::indexing::Slice(), 0})
+            .contiguous();
+    auto heightmap =
+        world.index({torch::indexing::Slice(), torch::indexing::Slice(), 1})
+            .contiguous();
+
+    // Allocate CPU memory
+    if (h_costmap)
+      delete[] h_costmap;
+    if (h_heightmap)
+      delete[] h_heightmap;
+    h_costmap = new float[map_size];
+    h_heightmap = new float[map_size];
+
+    // Copy data
+    memcpy(h_costmap, costmap.data_ptr<float>(), map_size * sizeof(float));
+    memcpy(h_heightmap, heightmap.data_ptr<float>(), map_size * sizeof(float));
+
+    map_size_px = H;
+
+    // Verify allocation
+    if (!h_costmap || !h_heightmap) {
+      throw std::runtime_error("Failed to allocate map memory");
+    }
+  }
+
+  // Creates a new Node with the given pose
+  std::shared_ptr<Node> create_Node(float *pose) {
+    return std::make_shared<Node>(pose, nullptr, nullptr, 0, resolution,
+                                  tolerance, division_factor,
+                                  timesteps, local_controllability_radius,
+                                  time_direction);
+  }
+
+  // Compute near-meet distance between two poses
+  float compute_near_meet_distance(float *pose1, float *pose2) {
+    return heuristic(pose1, pose2);
+  }
+
+  IGHASTAR_FILTER_TRAJECTORIES_ALL
+
+  void solve_2pBVP(
+      const std::vector<std::pair<std::shared_ptr<Node>, std::shared_ptr<Node>>>
+          &pairs,
+      std::vector<bool> &valid,
+      std::vector<std::vector<float>> &trajectories) {
+    solve_near_meet(this, pairs, valid, trajectories);
+  }
+
+  // Default calls sampling::sample_goal_region. Override to replace the sampler.
+  virtual std::vector<std::shared_ptr<Node>>
+  sample_goals(std::shared_ptr<Node> start, std::shared_ptr<Node> goal) {
+    return sampling::default_sample_goals(this, std::move(start), std::move(goal));
+  }
+
+  // Batched validity check for multiple states
+  void check_validity_batched(const std::vector<float *> &states,
+                              std::vector<bool> &results) {
+    int n_states = states.size();
+    results.resize(n_states);
+
+    float *states_array = new float[n_states * n_dims];
+    bool *result_array = new bool[n_states];
+    std::fill(result_array, result_array + n_states, true);
+
+    for (int i = 0; i < n_states; i++) {
+      memcpy(&states_array[i * n_dims], states[i], n_dims * sizeof(float));
+    }
+
+    check_validity_launcher_cpu(h_costmap, map_size_px, map_res, states_array,
+                                patch_length_px, patch_width_px, car_l2, car_w2,
+                                n_states, n_dims, result_array);
+
+    for (int i = 0; i < n_states; i++) {
+      results[i] = result_array[i];
+    }
+
+    delete[] states_array;
+    delete[] result_array;
+  }
+
+  // Calculates Euclidean distance between two poses
+  float distance(float *pose, float *goal) {
+    float dx = pose[0] - goal[0];
+    float dy = pose[1] - goal[1];
+    return std::sqrt(dx * dx + dy * dy);
+  }
+
+  // Checks if a node has reached the goal region within epsilon tolerance
+  bool reached_goal_region(std::shared_ptr<Node> v,
+                           std::shared_ptr<Node> goal) {
+    float dx = v->pose[0] - goal->pose[0];
+    float dy = v->pose[1] - goal->pose[1];
+    float cte = dx * cosf(goal->pose[2]) + dy * sinf(goal->pose[2]);
+    float ate = dx * sinf(goal->pose[2]) - dy * cosf(goal->pose[2]);
+    if (fabs(cte) < epsilon[0] && fabs(ate) < epsilon[1]) {
+      float dot_product = cosf(v->pose[2]) * cosf(goal->pose[2]) +
+                          sinf(v->pose[2]) * sinf(goal->pose[2]);
+      if (dot_product > cosf(epsilon[2])) {
+        if (fabs(v->pose[3] - goal->pose[3]) < epsilon[3]) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Calculates heuristic value for A* search
+  float heuristic(float *pose, float *goal) {
+    return distance(pose, goal) / max_vel;
+  }
+
+  // Checks validity of start and goal positions
+  void check_validity(float *start, float *goal, bool *result) {
+    float states[2 * n_dims];
+    memcpy(states, start, n_dims * sizeof(float));
+    memcpy(states + n_dims, goal, n_dims * sizeof(float));
+    check_validity_launcher_cpu(h_costmap, map_size_px, map_res, states,
+                                patch_length_px, patch_width_px, car_l2, car_w2,
+                                2, n_dims, result);
+  }
+
+  // function that returns a vector of nodes:
+  std::vector<std::shared_ptr<Node>> Succ(std::shared_ptr<Node> node,
+                                          std::shared_ptr<Node> goal) {
+    std::vector<std::shared_ptr<Node>> neighbors;
+    std::shared_ptr<Node> neighbor;
+    float new_pose[n_dims], f;
+
+    // Individual safety checks for initialized maps
+    if (!h_costmap) {
+      printf("ERROR: h_costmap pointer is null\n");
+      return neighbors; // Return empty vector if maps not initialized
+    }
+    if (!h_heightmap) {
+      printf("ERROR: h_heightmap pointer is null\n");
+      return neighbors; // Return empty vector if maps not initialized
+    }
+
+    float state[n_succ * n_dims];
+    float intermediate_states[timesteps * n_succ * n_dims];
+    bool valid[n_succ];
+    float cost[n_succ];
+    std::fill(valid, valid + n_succ, true);
+    std::fill(cost, cost + n_succ, 0.0);
+
+    for (int i = 0; i < n_succ; i++) {
+      memcpy(&state[i * n_dims], node->pose, n_dims * sizeof(float));
+    }
+
+    kinodynamic_launcher_cpu(
+        state, intermediate_states, h_heightmap, h_costmap, valid, cost, dt,
+        timesteps, n_succ, n_dims, n_cont, map_size_px, map_res, car_l2, car_w2,
+        max_vel, min_vel, RI, max_vert_acc, max_theta, gear_switch_time,
+        patch_length_px, patch_width_px, blocks, threads, controls);
+
+    std::vector<float> substep_times(timesteps);
+    fill_substep_times(substep_times.data(), node->time, dt, timesteps);
+    for (int i = 0; i < n_succ; i++) {
+      if (valid[i]) {
+        memcpy(new_pose, &state[i * n_dims], n_dims * sizeof(float));
+        // Allocate intermediate poses dynamically
+        float *new_intermediate_pose = new float[timesteps * n_dims];
+        memcpy(new_intermediate_pose,
+               &intermediate_states[i * timesteps * n_dims],
+               timesteps * n_dims * sizeof(float));
+        float *controls_seq = new float[timesteps * n_cont];
+        for (int t = 0; t < timesteps; t++) {
+          memcpy(controls_seq + t * n_cont,
+                 &controls[(i * timesteps + t) * n_cont], n_cont * sizeof(float));
+        }
+        neighbor = std::make_shared<Node>(
+            new_pose, new_intermediate_pose, node, node->g + cost[i],
+            resolution, tolerance, division_factor, timesteps,
+            local_controllability_radius, time_direction, controls_seq,
+            substep_times.data());
+        delete[] new_intermediate_pose;
+        delete[] controls_seq;
+        f = neighbor->g + heuristic(neighbor->pose, goal->pose);
+        neighbor->f = f;
+        neighbors.push_back(neighbor);
+      }
+    }
+
+    return neighbors;
+  }
+
+  // No GPU buffers in the CPU environment; preemptive expansion falls back to
+  // expanding each node sequentially.
+  void ensure_batch_capacity(int /*max_batch*/) {}
+
+  // Batched successor (CPU fallback): expands each parent via Succ and returns
+  // one neighbor list per parent, preserving input order.
+  std::vector<std::vector<std::shared_ptr<Node>>>
+  Succ_batched(const std::vector<std::shared_ptr<Node>> &nodes,
+               std::shared_ptr<Node> goal) {
+    std::vector<std::vector<std::shared_ptr<Node>>> results;
+    results.reserve(nodes.size());
+    for (const auto &node : nodes) {
+      results.push_back(Succ(node, goal));
+    }
+    return results;
+  }
+
+  torch::Tensor convert_node_list_to_path_tensor(
+      std::vector<std::shared_ptr<Node>> node_list) {
+    return path_tensor_from_edges(node_list, timesteps);
+  }
+
+  torch::Tensor convert_node_list_to_controls_tensor(
+      std::vector<std::shared_ptr<Node>> node_list) {
+    return controls_tensor_from_edges(node_list, timesteps);
+  }
+};
