@@ -2,6 +2,17 @@
 
 This repository holds the vehicle models for [IGHA*](https://github.com/personalrobotics/IGHAStar). IGHA* is the search. The search code stays in that repository. This repository holds the rollout code.
 
+On the Allen Backside kinodynamic set, the successor call is about 3 times shorter after the packed graph. The before run is 625 expansions with the old direct launch. The after run is 5000 expansions with the packed graph. Both runs have preemption on. Successor time is the successor call divided by popped expansions. It does not include the bidirectional barrier.
+
+| | Before | After | Faster |
+|---|---|---|---|
+| IGHA* successor | 71 µs | 26 µs | 2.7× |
+| BiIGHA* successor | 84 µs | 24 µs | 3.6× |
+| IGHA* wall rate | 9280 exp/s | 12031 exp/s | 1.3× |
+| BiIGHA* wall rate | 7037 exp/s | 19067 exp/s | 2.7× |
+
+The before run still waits on the bidirectional barrier. The after run does not. IGHA* never waits on that barrier, so the IGHA* rows are the model only. The BiIGHA* wall rate mixes the model with the barrier removal. The successor rows do not. Solved counts moved from 81/170 and 128/170 to 128/170 and 144/170. Part of that is the larger budget.
+
 Three models are here.
 
 - `kinematic` moves with a commanded speed and a curvature.
